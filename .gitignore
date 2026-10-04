@@ -1,1 +1,39 @@
+# Existing repository tooling
 _codeql_detected_source_root
+
+# Credentials and machine-local settings
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.mobileprovision
+mac-backend.json
+__pycache__/
+*.pyc
+
+# Build products and local runtime data
+**/target/
+**/data/
+*.sqlite*
+*.db
+*.db-*
+*.log
+outputs/
+backend/models/
+backend/runtime/
+
+# Recordings, capture exports and downloaded model weights
+recordings/
+captures/
+transcripts/
+*.wav
+*.m4a
+*.mp3
+*.opus
+*.pcm
+*.mp4
+*.mov
+*.gguf
+*.ggml

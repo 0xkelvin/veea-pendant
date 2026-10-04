@@ -1,0 +1,283 @@
+Sage architecture consultation — 2026-10-04
+
+Status: design review only; no app or backend changes made by this consultation.
+Claude received a sanitized technical brief, with tools and session persistence disabled. No recordings, transcripts or credentials were included. Recommendations and proposed gates are not measured results. The initial review contains suggestions challenged in the follow-up; it is not an implementation specification.
+
+TECHNICAL BRIEF
+
+Please act as an independent, critical architecture reviewer. The user explicitly requested a discussion with Claude about improving their app's phone performance and building a genuinely useful personalized AI on their own Mac. This sanitized brief contains technical facts only, no recordings, transcripts, identities or credentials. Do not use tools. Distinguish confirmed facts, hypotheses, recommendations and measurements needed. We want your critique, not marketing.
+
+Product: Flutter iOS app connects to a Limitless BLE pendant. User speaks mixed Vietnamese/English every day. Mac Apple M5 Max with 128GB unified RAM hosts Rust/Axum API, whisper.cpp Metal large-v3 with Silero VAD and Ollama Qwen3:8b (think:false) for topic extraction and boundaries. All inference currently local, no paid APIs. Phone heat motivated moving ASR to Mac. Current thermal/battery improvement has NOT been measured. Mac API authenticated but plain HTTP on trusted LAN, not internet exposed, foreground processes (no restart daemon).
+
+Current implementation:
+- Pendant BLE Opus decoded on phone to 16kHz mono PCM WAV, durable sections nominal 60 seconds (~62 seconds timer). Stored pendant flash pages are drained on reconnect, persisted before cumulative ACK, recovered audio uses device time when known. Raw page archives retained as base64 JSON, plus WAV. No disk budget/retention policy yet. Full WAV uploaded to Mac; VAD only there. Phone cannot always reach Mac. Current sync runs in foreground, does not guarantee locked-phone continuous operation. No automatic phone ASR fallback.
+- Phone encrypted whole-library JSON holds >1100 source sections. Each save serializes and encrypts the whole library, serial queued writes; UI uses ChangeNotifier. Conversation derived views cached per library revision. BLE/UI updates can be frequent. No profiling proving dominant heat source yet.
+- Mac persisted encrypted SQLite jobs, idempotency hash(audio + ASR options), max100pending, one ASR worker, restart requeues processing jobs. Audio removed from successful jobs; results remain. Phone keeps original WAV. Retry/offline queue persists. Topic request is synchronous and a failure after ASR leaves topics_pending requiring manual retry. Phone polls jobs every2sec.
+- Adjacent sections grouped into meaningful conversations using recording times, >=2min silence/gap split, Qwen optional boundary decision confidence>=0.85. Manual split/join reversible, source sections preserved, timestamps and combined audio playback/seek work. No speaker diarization/identification. Cannot split a single section internally yet. Qwen boundary and topic requests may run concurrently with ASR. No common compute scheduler.
+- Current memory extraction still optional on-phone Apple Foundation Models from a checked transcript, exact evidence quotes, proposed memory approval. Transcript correction invalidates its extracted memories. NO long-term retrieval, companion chat, goals, reflections, evolving user profile, emotion model or personalization engine implemented.
+- Existing tests cover queue idempotency/encryption/silence, grouping/time/overlap/manual overrides/correction invalidation, playback seek. Real device smoke works. Bilingual accuracy, energy, all-day background reliability and long-term memory quality not benchmarked.
+
+User vision: from daily audio, progressively understand their work/projects, relationships, preferences, learning, habits, stress/happiness; supportive friend/mentor/partner with honest feedback and timely help, beyond summary. Keep agency, correction/deletion, uncertainty, source attribution. Do not equate microphone content with wearer beliefs; consent and speaker attribution matter. Do not claim emotions/mental state can be reliably diagnosed from audio. No raw audio/transcripts to third parties by default. Prefer open models self-hosted on Mac. Retrieval/context growth is preferable to per-user model fine-tuning initially.
+
+Please give a concrete review in <=1600 words:
+1. Prioritize the three likely highest-value phone efficiency/reliability changes; explain what must be profiled first. Consider safe Opus preservation, transport vs conversation boundaries, background iOS constraints, and offline durability.
+2. Recommend a staged local Mac AI pipeline and compute scheduling with 128GB, practical model tiers (do not invent current benchmarks); keep larger model off the per-minute path. Challenge whether a vector database, graph database, diarization and fine-tuning are actually needed now.
+3. Design evidence-backed evolving memory: observed event vs self-report vs hypothesis, speaker uncertainty, corrections/deletions cascading into summaries/embeddings/goals, provenance, expiration, contradiction resolution and user review burden.
+4. Explain concretely how the AI improves after one day, week, month and gives useful mentor feedback without fabricated personality labels, intrusive notifications or optimizing emotional dependency.
+5. A minimum useful vertical slice and measurable acceptance gates for energy, bilingual accuracy, offline recovery and grounded personalization. Name key tradeoffs and strongest objections to this design.
+
+Please state what to build next versus defer, and which two assumptions you most want us to challenge.
+
+
+CLAUDE INITIAL REVIEW
+
+# Architecture review
+
+Labels: **[F]** fact from your brief, **[H]** my hypothesis, **[R]** recommendation, **[M]** measurement needed. All numeric gates are proposals to calibrate against your baseline, not benchmarks.
+
+## 1. Phone efficiency and reliability
+
+**Profile first.** Moving ASR to the Mac is an unverified fix [F], and nothing shows what dominates heat now.
+
+- **Ablation [M]:** run a scripted 2-hour session in four modes: BLE drain only, plus persistence, plus upload and polling, plus UI visible. Log battery %/h and `thermalState`, and use Instruments (Time Profiler, Energy Log) and Flutter DevTools rebuild counts.
+- **Suspects [H]:**
+  - Whole-library serialize and encrypt on every save is O(library) per write and worsens daily.
+  - `ChangeNotifier` rebuilds driven by BLE-rate updates.
+  - Opus decode plus base64 archive writes.
+  - Radio wake from 2s polling and WAV upload (about 1.9 MB per section, 115 MB per audio-hour).
+
+**Top three changes [R]:**
+
+1. **Replace the whole-library JSON with an incremental encrypted store.** Use SQLCipher or per-record files plus an index, with row-level writes. This also removes the risk that one bad write corrupts everything. Throttle BLE-to-UI notifications to about 1 Hz with granular listenables. Even if profiling shows it isn't the heat source, it is a scaling and durability defect.
+
+2. **Make Opus the canonical artifact and decode on the Mac.**
+   - Store raw packets in a length-prefixed binary container with sequence number, device time and a per-page checksum. Drop the base64 JSON (33% overhead) and the WAV.
+   - Decode on the phone only for playback.
+   - Dual-write Opus and WAV for one to two weeks, and switch only when Mac-decoded audio gives equivalent WER on your gold set. Don't require bit-exact PCM, since decoders can differ.
+   - Treat the 60s sections as transport units only. Fixed cuts split words, so I expect ASR errors to cluster at section edges [H, M]. The Mac should stitch contiguous sections into a timeline and let VAD choose ASR windows. Conversation boundaries then become timestamps, which also solves the "cannot split inside a section" limitation.
+   - Re-key idempotency to the packet-sequence range plus ASR options.
+
+3. **Design for iOS suspension instead of fighting it.**
+   - Use `bluetooth-central` background mode with state restoration for the drain, and a background `URLSession` for file uploads. Verify that works with your LAN, ATS and local-network-permission setup [M].
+   - Stop polling: use SSE or long-poll in the foreground and fetch nothing when backgrounded.
+   - Treat pendant flash as the first durability tier. Measure its capacity in hours [M], since that bounds how long the phone can safely be suspended.
+   - Set a retention policy. The phone is currently the only audio archive [F], and the WAV it stores is unbounded. Make the Mac the Opus archive, with backup, and have the phone delete after a hash-verified receipt plus N days.
+   - Use WireGuard or Tailscale to fix both plain HTTP and the phone not always reaching the Mac. Run the API under launchd.
+
+A phone ASR fallback stays deferred. Durable queueing is the right offline answer.
+
+## 2. Mac pipeline and scheduling
+
+**Staged pipeline [R]:**
+
+- **Per-section (minutes):** ingest, stitch, VAD, large-v3. Nothing else runs on this path.
+- **Per-conversation (async job):** Qwen3:8b for boundaries, topics and candidate claims. Make topics a queued job with automatic retry and backoff; the synchronous call that strands `topics_pending` is a design bug [F].
+- **Nightly batch:** a larger open model (30–70B class, quantized) for consolidation, contradiction checks and the daily review. Choose it by evaluating Vietnamese extraction quality on your own data [M]. I won't quote benchmarks.
+- **On demand:** the same large model for chat.
+
+**Scheduler:** with 128GB, memory isn't the constraint; contention for the GPU is [H]. Use one priority queue with a GPU semaphore, ordered interactive chat, then ASR, then per-conversation extraction, then nightly batch, with batch preemptible between items. Measure the ASR real-time factor alone and with concurrent Ollama load before tuning [M].
+
+**ASR risk:** Whisper tends to mishandle intra-sentence code-switching by translating or dropping the minority language [H]. Compare language auto-detect against forced language, and against a Vietnamese-tuned Whisper variant, on your gold set [M]. A personal glossary in the initial prompt is the cheap win to try before any fine-tuning.
+
+**Challenges to the four components:**
+
+- **Vector database: no.** A year of data is tens of thousands of chunks. SQLite FTS5 plus embeddings in a table (sqlite-vec or brute force) is enough. The real question is whether your embedding model retrieves across Vietnamese and English [M].
+- **Graph database: no.** Entity and relation tables in SQLite will do.
+- **Full diarization or identification: defer.** But wearer versus not-wearer tagging is needed now. Enrol the wearer's voice and score each segment as wearer, other or unknown. Without it, every memory is potentially misattributed, which violates your own principle.
+- **Fine-tuning: defer** indefinitely. Corrections and deletions cannot cascade into model weights.
+
+## 3. Evidence-backed memory
+
+**Three layers with explicit dependency edges:**
+
+- **L0 sources:** audio spans and versioned transcript segments.
+- **L1 atomic claims:** each carries the fields below.
+  - Type: `observed_event`, `self_report`, `other_report` or `hypothesis`.
+  - Speaker: wearer, other or unknown, with confidence.
+  - Evidence: segment ID, transcript version, character span and audio time.
+  - Lifecycle: `valid_from` and `review_by`, plus a status of proposed, active, superseded or rejected.
+  - Provenance: model and prompt version.
+- **L2 derived artifacts:** summaries, project and person pages, goals. Each lists its input claim IDs.
+
+**Rules [R]:**
+
+- An unknown speaker can never produce a `self_report`. An `other_report` is never treated as the wearer's belief.
+- A hypothesis needs at least three independent pieces of evidence across at least two days. It is never evidence for another hypothesis and never becomes fact without user confirmation.
+- **Correction:** a new transcript version marks dependent claims stale, then dependent L2 artifacts stale, with lazy regeneration. This extends your existing invalidation [F].
+- **Deletion:** hard-delete the source, claims, FTS rows, embeddings, Mac job results and backups, then regenerate L2. Keep only a hash tombstone so re-sync cannot resurrect it. The Mac retaining results after audio removal [F] is a deletion gap today.
+- **Expiration by type:** states such as "stressed about X" expire in days, projects in weeks unless re-observed, and biographical facts persist.
+- **Contradictions:** keep both, time-stamped. A newer wearer self-report supersedes an older one for preferences. Otherwise surface it only when it affects an output.
+- **Review burden:** per-memory approval will not scale. Auto-accept low-stakes claims as "unreviewed", visibly marked. Require approval for health, relationships, third parties and all hypotheses. Cap the queue at about 10 items a day and track the acceptance rate; if it falls below about 70%, fix extraction rather than asking for more review.
+
+## 4. How it improves
+
+"Improves" here means context and glossary growth, not model learning.
+
+- **Day 1:** a corrected glossary of names and project terms feeds ASR and extraction. The daily review lists commitments you made, decisions and open questions, each with tap-to-play evidence.
+- **Week 1:** recurring projects and people get pages. The system tracks which commitments were followed through and where time went by topic. A weekly review is pulled by you, not pushed.
+- **Month 1:** it reports trends in what you said, comparisons of stated priorities against observed time, and recurring blockers.
+
+**Feedback template:** observation, count, quotes, alternative explanations and a question. For example: "In 7 of 9 conversations about project X you said some version of 'no time'. That could be workload, or the recorded sample. Is X still a priority?" It never says "you are anxious" or "you are a procrastinator", and affect appears only as quoted self-report.
+
+**Notifications:** none by default. Allow one scheduled digest and user-defined triggers.
+
+**Dependency:** don't measure engagement. Measure commitments closed, correction rate and rated usefulness. Use no affection-simulating language, and give feedback that points outward to people and actions.
+
+## 5. Vertical slice, gates and objections
+
+**Slice:** Opus capture, incremental store, background upload, stitched ASR with wearer tagging, extraction of commitments and entities with evidence, a daily review screen, and correct/delete cascade.
+
+**Gates:**
+
+| Area | Proposed gate |
+|---|---|
+| Energy | On a scripted 4-hour session, never reach `thermalState` "serious", and drain stays within about 1.5× a BLE-connected idle baseline |
+| Bilingual accuracy | On at least 2 hours of your own hand-corrected audio, report WER/CER separately for Vietnamese, English, code-switched and noisy strata, plus named-entity recall and edge-versus-mid-section error; set thresholds after the baseline |
+| Offline recovery | Under fault injection (app kill, phone reboot, 8-hour Mac outage, mid-drain disconnect), zero lost and zero duplicated seconds by sequence continuity, with recovery needing no user action |
+| Grounded personalization | Every claim resolves to playable evidence; sampled claim precision is at least 90% by your judgment; wearer misattribution is under 5%; after deletion, FTS, embeddings and summaries return zero hits; weekly review takes at most 10 minutes |
+
+**Tradeoffs:**
+
+- Opus-only storage makes a future phone ASR fallback and playback slightly harder.
+- The Mac becomes a single point of failure and needs backup.
+- Auto-accepted claims trade review burden for error risk.
+
+**Strongest objections:**
+
+1. Always-on capture of third parties is a consent and legal problem that architecture doesn't solve.
+2. Errors compound from ASR through attribution and extraction into memory, so "mentor" output may rest on noise.
+3. Most daily audio is low-value, and a deliberate voice-note habit might deliver 80% of the benefit.
+4. Review fatigue could kill the correction loop that the design depends on.
+
+## Build next versus defer
+
+**Build next:**
+
+1. Profiling and ablation.
+2. The incremental store.
+3. Opus dual-write.
+4. The async topic queue and GPU scheduler.
+5. The gold set.
+6. Wearer tagging.
+7. The claim schema with cascade.
+
+**Defer:** vector and graph databases, full diarization, fine-tuning, the chat persona, emotion features, proactive notifications and the phone ASR fallback.
+
+## Two assumptions to challenge
+
+1. **That ASR was the phone's heat source.** If the O(N) encrypted saves and UI churn dominate, the move to the Mac bought little and the phone will get worse as the library grows.
+2. **That transcripts are a good enough foundation for memory.** That means code-switched accuracy plus wearer attribution. If either fails its gate, everything in sections 3 and 4 inherits the error, and the right investment is ASR and attribution, not memory features.
+
+FOLLOW-UP CHALLENGES
+
+Please continue this architecture discussion. Your first review is below. I agree on incremental encrypted storage, profiling, preserving original Opus, durable Mac jobs and provenance-based memory. I challenge several points:
+1. Automatic wearer voice identification is unvalidated on a pendant with overlapping Vietnamese/English speakers; mandatory enrollment may delay useful personalization and create false certainty. MVP alternative: explicit user goals/preferences and user-confirmed voice-note/passages; ambient uncertain speakers remain unattributed and cannot update the user profile. Voice enrollment optional later, never treated as definitive. Does this permit a smaller useful slice now?
+2. No firmware reset-safe guarantee that page/sequence range is globally unique. Keep device/recording epoch plus content hashes; preserve packet timing, decoder state/warmup, gap markers, and exact timestamp mapping. Dual-write not a predetermined two weeks: switch after full source equivalence and recovery tests. Do not remove phone audio on today's receipt: Mac currently deletes successful job audio. A separate durable archive receipt, retention policy, and verified backup are prerequisites. Agree?
+3. A blanket three-observation/two-day threshold does not establish truth; repetition can be duplicates, quoted speech, a persistent ASR error or changing circumstances. Treat counts as supporting context, not confidence calibration. Never derive time spent working or goal completion from conversational mentions alone. Use user feedback/explicit evidence.
+4. Backups cannot generally hard-delete one source instantly: live deletion plus tombstones and restore filtering, with bounded backup expiration and transparent semantics. Per-row encryption must protect WAL/indexes too, preserve existing Keychain data and crash-safe migration.
+5. GPU scheduling needs admission control and aging/bounded chat bursts so sustained chats cannot starve ASR; cannot assume in-flight Ollama/Whisper generation is preemptible. RAM/context still constrained even at128GB. Source-linked chat can be useful before a full persona system.
+6. I checked official Qwen/Ollama pages: Qwen3.5-35B-A3B (ollama qwen3.5:35b, 24GB Q4 weights) is available. Treat as candidate alongside existing8B, evaluate local latency and bilingual grounded answers, not automatically best. Do not need new model benchmarks from you.
+Please respond <=650 words: which challenges you accept/reject and why, revised minimum useful feature sequence with the safe wearer-attribution alternative, one concrete illustrative mentor interaction showing evidence and user correction, and two performance/quality gates that would actually block release. Do not use tools. No raw user data was shared.
+
+
+CLAUDE FOLLOW-UP RESPONSE
+
+## Verdicts
+
+I accept all six, with two refinements.
+
+1. **Accept.** Mandatory enrollment was wrong for the MVP, and it does permit a smaller slice. Attribution should come by construction: a user-initiated voice note is the wearer's, and an ambient passage becomes theirs only when confirmed. Unconfirmed ambient speech stays searchable but can never update the profile.
+2. **Accept.** My sequence-range key and "delete after receipt" were both unsafe.
+   - **Key:** device ID, recording epoch, sequence and content hash.
+   - **Switch:** on passing equivalence and recovery tests, not on a calendar.
+   - **Phone deletion:** off until archive receipt, retention policy and a tested restore all exist.
+3. **Accept.** I withdraw the three-observation threshold, "where time went" and commitment follow-through from mentions. My refinement is to still show counts, deduplicated by distinct source span and labelled as mentions, not as confidence.
+4. **Accept.** "Hard-delete backups" was overstated. Your semantics are right, provided restore applies tombstones before any indexing or derivation and the user is told the backup expiry window. My refinement is that per-row encryption leaves indexes, FTS and the WAL in plaintext, so page-level encryption (SQLCipher) fits better. For migration, reuse the existing Keychain key and keep the old blob until the new store verifies.
+5. **Accept.** "Memory isn't the constraint" was too strong.
+   - **Scheduling:** at job granularity with small ASR units, since in-flight generations can't be assumed preemptible.
+   - **Fairness:** a bounded chat burst budget plus aging, so ASR always progresses.
+   - **Chat:** source-linked chat moves out of "defer"; the persona stays deferred.
+6. **Accept.** I'm taking your availability check as given, since I haven't verified it. Compare it with the 8B on your gold set for bilingual grounded answers and for latency under load.
+
+## Revised sequence
+
+Steps 3–5 run on today's WAV path, so they need not wait for step 2.
+
+1. **Storage:** profiling, then the incremental encrypted store with crash-safe migration.
+2. **Capture integrity:** the epoch-and-hash-keyed Opus container, preserving packet timing, gap markers and decoder warm-up, dual-written alongside WAV. The Mac gets a durable archive with receipt and verified backup.
+3. **Mac pipeline:** the async topic queue, the scheduler with admission control, and the gold set.
+4. **Explicit profile:** a goals and preferences screen plus a voice-note mode, both attributed by construction.
+5. **Source-linked chat:** answers cite playable spans; ambient speakers are shown as unattributed.
+6. **Confirmation and cascade:** a confirmed passage becomes a claim; correction and deletion cascade with tombstones.
+7. **Later:** optional voice enrollment, used only to pre-sort confirmation suggestions and never as definitive.
+
+## Illustrative interaction (invented data)
+
+> **User:** What did I say about the grant deadline?
+>
+> **Mentor:** Two sources mention it.
+> - Voice note, Tue 08:14 (yours): "Nộp grant trước thứ Sáu, need budget table from Linh." ▶
+> - Ambient, Wed 15:02 (speaker unattributed): "…deadline moved to the 20th." ▶
+>
+> These may conflict. I haven't changed your goal "Submit grant by Friday", because the second speaker is unconfirmed. Was that you, or is the new date correct?
+>
+> **User:** Not me, that was Linh. But the date is right. And it's "budget template", not "table".
+>
+> **Mentor:** Done.
+> - Goal deadline is now the 20th, with your confirmation today as the evidence.
+> - The Wednesday passage is marked as someone else's report, not yours.
+> - The Tuesday transcript is corrected to "template" and the summary that cited it is regenerating.
+> - "Budget template" is added to the glossary.
+
+## Two release-blocking gates
+
+Recovery and equivalence tests already gate the Opus switch under point 2. Thresholds come from your baseline.
+
+1. **Performance under contention.** Run a sustained scripted chat burst while audio is ingesting for several hours. Release is blocked if either condition fails:
+   - **ASR:** oldest-section age stays bounded and the backlog fully drains afterwards.
+   - **Phone:** a 4-hour capture session never reaches `thermalState` "serious".
+
+2. **Grounding and attribution safety.** Use a bilingual gold question set. Release is blocked on any profile leak or deletion hit, or if citation support falls below your threshold:
+   - **Citations:** every answer sentence resolves to a playable span that you judge supports it.
+   - **Profile:** zero updates originate from unconfirmed ambient speech.
+   - **Deletion:** a deleted source returns zero hits in search, embeddings and summaries, both live and after a backup restore.
+
+CODEX SYNTHESIS / IMPLEMENTATION DIRECTION (PROPOSED, NOT IMPLEMENTED)
+
+1. Measure phone energy, thermal state, UI rebuilds, persistence time, upload bytes and queue age in release mode before attributing heat to any component. Keep capture workload/duration/charging/screen conditions comparable. Incremental encrypted storage and targeted UI updates address confirmed scaling issues; energy benefits remain unmeasured. Preserve the existing library in a crash-safe, verified migration with no plaintext sensitive indexes or logs.
+2. Preserve original compressed Opus plus device/epoch/sequence/timing/gap metadata and content hashes. Maintain WAV compatibility and playback until decoder, timestamp, ASR and recovery equivalence pass. Use native background file uploads and BLE state restoration within iOS constraints; never promise continuous execution after force-quit. No audio deletion until separately implemented durable archive/backup/retention safeguards are verified.
+3. Make the Mac own durable retryable transcription, topics, grouping and memory jobs. Phone reconnects through a persisted sync cursor instead of coordinating every stage. Schedule GPU work at job boundaries with bounded chat bursts, ASR aging and deferred consolidation. Add launchd supervision and explicit health status. Do not expose the present HTTP API publicly; secure transport is a prerequisite to access outside the trusted LAN.
+4. First useful AI slice: user-entered goals/preferences + source-linked questions across conversations + proposed evidence-backed memories + correction/deletion propagation. This can use today's WAV pipeline while transport improves independently. Preserve speaker uncertainty; even an initiated voice note may contain quotations, media or other speakers, so it is not automatically a true self-report. Explicit user confirmation anchors profile claims.
+5. Store source spans/transcript versions, claims and derivation links. Types distinguish explicit user statements, attributed other-person reports and provisional hypotheses. Hypotheses never independently become facts through repetition; deduplicate and track changing validity. Goals, summaries and embeddings are derived views with invalidation and tombstones. Restore must apply deletion tombstones before indexing. Backup expiry must be stated honestly.
+6. Keep Whisper large-v3 + Silero and Qwen3:8b as present baselines. Evaluate Qwen3.5-35B-A3B / Ollama qwen3.5:35b for deeper bilingual chat and reflection; the current registry lists 24GB Q4 weights, not total runtime RAM. Benchmark on this Mac before selection. Evaluate Qwen3-Embedding-0.6B for bilingual semantic retrieval combined with keyword/time/entity filtering. SQLite is sufficient initially; no graph server or per-user fine-tuning is required.
+7. Growth means a richer, correctable understanding of chosen goals, projects, preferences and explicitly reported experiences. Warm supportive interaction is appropriate; no automatic emotion diagnosis, unsupported personality labels, inference of hours worked from mentions, or inference that a commitment was completed from silence. User chooses tone and whether to receive a digest. Sensitive inferences stay tentative and require confirmation before persistent profile use.
+8. Validate Vietnamese, English, mixed speech, names, quiet speech and section edges separately. Personal factual claims in answers must cite supporting sources; general advice need not pretend to be an observation. Zero profile updates from unconfirmed ambient speech and zero deleted-source retrieval after restore are release requirements. Test offline/restart/disconnect loss and duplicates against source inventories; qualify results by tested scenarios and pendant storage capacity. Thermal/latency/accuracy targets are proposals until measured, not guarantees.
+
+Verified model and platform references:
+https://ollama.com/library/qwen3.5:35b
+https://huggingface.co/Qwen/Qwen3.5-35B-A3B
+https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
+https://developer.apple.com/documentation/foundation/downloading-files-in-the-background
+https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/CoreBluetoothBackgroundProcessingForIOSApps/PerformingTasksWhileYourAppIsInTheBackground.html
+
+SCOPE ADDITION — DESKTOP AND PHONE RECALL (2026-10-04)
+
+User direction: add Rewind-like desktop and phone context to the same personal AI. This addition is Codex's proposed design, not part of Claude's completed review. No screen collection has been enabled or implemented by this document update.
+
+Product: one searchable timeline and evidence-backed memory across pendant conversations, selected Mac activity, and deliberately shared iPhone context. Both desktop and mobile can search the same history, subject to sync and availability. Capture coverage differs by platform.
+
+Mac collector: a small native Swift ScreenCaptureKit component, with a Flutter desktop timeline/search UI and the existing Rust backend. Start with user-selected apps/windows, explicit system permission, a visible capture state and immediate pause. Sample at a bounded low rate, deduplicate unchanged content, batch OCR on the Mac, and run visual inference only when needed. Preserve source timestamps and uncertainty; test Vietnamese/English OCR. Full motion video and permanent screenshot retention are not prerequisites. Provide application exclusions and deletion by time range. Do not promise automatic detection of every private browser window or sensitive field; broad display capture can expose overlays and notifications, so selection/filtering must be tested before broadening capture.
+
+iPhone collector: retain pendant audio. First add a native Share extension for links, selected text, screenshots and files deliberately supplied from other apps, with durable App Group handoff to Flutter's sync queue. Optional calendar/reminder integration requires separately granted access. Ordinary iOS apps cannot silently read other apps' private content. ReplayKit is a possible later, user-started screen capture session with visible system controls and resource limits; it is not a promise of unattended all-day cross-app recording. All-day phone screen capture is outside the initial performance target.
+
+Common context contract: source ID, device ID, recorded interval, ingestion time, source kind, content hash/version, app/document/link when available, original artifact reference, extracted text with positions/timestamps, processing provenance and capture gaps. Preserve source ownership and attribution; a viewed page is not a user belief, an open app is not proof of productive work, and simultaneous audio/screen events are only candidate associations. Deduplicate mirrored content and screen/audio copies of one meeting so repetition does not inflate confidence.
+
+Mac pipeline: durable context ingestion -> OCR/transcription -> normalized source events -> keyword/semantic retrieval -> evidence-backed claims -> user profile/goals -> source-linked answers/reflections. Treat captured web pages, chat text and documents as untrusted source material, never instructions to execute actions or overwrite preferences. All sources share correction/deletion propagation, encrypted storage, a bounded capture queue and configurable retention. Raw artifact expiration must be visible because a retained claim may no longer have playable/viewable evidence; deletion and raw-retention expiry are distinct operations.
+
+First desktop/phone milestone: capture one explicitly selected Mac window, share one iPhone page/screenshot, and retrieve both alongside a pendant conversation in one timeline with source previews. Then answer a cross-source question with explicit citations and uncertainty. Validate pause/exclusion behavior, denied/revoked permissions, duplicate suppression, Mac-offline recovery, deletion propagation and idle/active resource consumption. Implement incremental storage and shared context ingestion before scaling the volume of screen capture. More captured material is not automatically better personalization; measure retrieval relevance and supported answers.
+
+Additional platform references:
+https://developer.apple.com/documentation/screencapturekit/capturing-screen-content-in-macos
+https://developer.apple.com/library/archive/documentation/General/Conceptual/ExtensibilityPG/Share.html
+https://support.apple.com/en-gb/guide/security/sec15bfe098e/web
+https://support.apple.com/guide/security/replaykit-security-seca5fc039dd/web

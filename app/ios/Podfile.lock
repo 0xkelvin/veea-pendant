@@ -1,0 +1,22 @@
+PODS:
+  - Flutter (1.0.0)
+  - opus_flutter_ios (1.4.0):
+    - Flutter
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - opus_flutter_ios (from `.symlinks/plugins/opus_flutter_ios/ios`)
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  opus_flutter_ios:
+    :path: ".symlinks/plugins/opus_flutter_ios/ios"
+
+SPEC CHECKSUMS:
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  opus_flutter_ios: f16ed3599997ced564ad44509e87003159a86def
+
+PODFILE CHECKSUM: 925325d20e05a8bbfce919e0da669633c652835f
+
+COCOAPODS: 1.17.0
